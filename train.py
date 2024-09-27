@@ -1,212 +1,258 @@
-from model import build_transformer
-from dataset import BilingualDataset, causal_mask
+import os
+import argparse
+
+from local_dataloader import TranslationDataLoader, get_causal_mask
 from config import get_config, get_weights_file_path, latest_weights_file_path
 
-import torchtext.datasets as datasets
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.optim.lr_scheduler import LambdaLR
+from model import build_transformer
 
-import warnings
+import torch
+import torch.profiler
+from torch import cuda
+
+from torch.utils.data import DataLoader, random_split
+
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel
+from torch.distributed import init_process_group, destroy_process_group
 from tqdm import tqdm
-import os
 from pathlib import Path
+import torchmetrics
+
 
 # Huggingface datasets and tokenizers
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
 
-import torchmetrics
+
 from torch.utils.tensorboard import SummaryWriter
 
-def greedy_decode(model, source, source_mask, tokenizer_src, tokenizer_tgt, max_len, device):
-    sos_idx = tokenizer_tgt.token_to_id('[SOS]')
-    eos_idx = tokenizer_tgt.token_to_id('[EOS]')
 
-    # Precompute the encoder output and reuse it for every step
-    encoder_output = model.encode(source, source_mask)
-    # Initialize the decoder input with the sos token
-    decoder_input = torch.empty(1, 1).fill_(sos_idx).type_as(source).to(device)
-    while True:
-        if decoder_input.size(1) == max_len:
+def run_inference(model, one_batch, inference_device, output_tokenizer, seq_len):
+
+    encoder_input = one_batch["encoder_input"].to(inference_device)
+    encoder_mask = one_batch["encoder_mask"].to(inference_device)
+    # Since its going to be used all the time
+
+    encoder_output = model.encode(encoder_input, encoder_mask)
+    decoder_input = torch.empty(1,1).fill_(output_tokenizer.token_to_id("[SOS]")).type_as(encoder_input).to(inference_device)
+
+    next_token = None
+
+    eos_tgt_tokenizer_id = output_tokenizer.token_to_id("[EOS]")
+
+    print(f"EOS ID: {eos_tgt_tokenizer_id}")
+
+    while (not next_token) or (next_token.item() != eos_tgt_tokenizer_id):
+        if decoder_input.size(1) > seq_len:
+            print(f"Shape: {decoder_input.shape}, Value: {value}, Next Token: {next_token.item()}")
             break
 
-        # build mask for target
-        decoder_mask = causal_mask(decoder_input.size(1)).type_as(source_mask).to(device)
-
-        # calculate output
-        out = model.decode(encoder_output, source_mask, decoder_input, decoder_mask)
-
-        # get next token
-        prob = model.project(out[:, -1])
-        _, next_word = torch.max(prob, dim=1)
-        decoder_input = torch.cat(
-            [decoder_input, torch.empty(1, 1).type_as(source).fill_(next_word.item()).to(device)], dim=1
+        decoder_mask = get_causal_mask(
+            decoder_input, output_tokenizer.token_to_id("[PAD]"), decoder_input.size(1),
+            put_mask_to_device=inference_device
         )
 
-        if next_word == eos_idx:
+        decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask)
+        # B * seq_len * vocab
+        logits = model.project(decoder_output[:, -1])
+        # Greedy decoding
+        value, next_token = torch.max(logits, dim=1)
+
+        # Re-calculate decoder input
+        decoder_input = torch.cat([
+            decoder_input,
+            torch.empty(1,1).fill_(next_token.item()).type_as(encoder_input).to(inference_device)
+            # Important to cat on dim=1 because dim=0 is batch size
+        ], dim=1)
+
+    # decoder input = (B, vocab)
+    # Typically, hugging face tokenizer strips special tokens
+    return output_tokenizer.decode(decoder_input.squeeze(0).detach().cpu().numpy())
+
+def validate_training_results(model, val_ds, output_tokenizer, inference_device, seq_len, global_step, writer, use_parallel):
+    # !!!!!
+    model.eval()
+    counter = 0
+    outputs = []
+    expected_texts = []
+
+    for one_batch in val_ds:
+        # !!!!
+        print(f"Inference {counter}")
+        with torch.no_grad():
+            outputs.append(run_inference(
+                model.module if use_parallel else model,
+                one_batch, inference_device, output_tokenizer, seq_len))
+        expected_texts.append(one_batch["tgt_text"][0])
+
+        # Just do 5 infernece
+        if counter > 5:
             break
 
-    return decoder_input.squeeze(0)
+        counter += 1
+
+    score_results(outputs, expected_texts, global_step, writer)
 
 
-def run_validation(model, validation_ds, tokenizer_src, tokenizer_tgt, max_len, device, print_msg, global_step, writer, num_examples=2):
-    model.eval()
-    count = 0
+def score_results(predicted, expected, global_step, writer):
+    # Evaluate the character error rate
+    # Compute the char error rate 
+    metric = torchmetrics.text.CharErrorRate()
+    cer = metric(predicted, expected)
+    writer.add_scalar('validation cer', cer, global_step)
 
-    source_texts = []
-    expected = []
-    predicted = []
+    # Compute the word error rate
+    metric = torchmetrics.text.WordErrorRate()
+    wer = metric(predicted, expected)
+    writer.add_scalar('validation wer', wer, global_step)
 
-    try:
-        # get the console window width
-        with os.popen('stty size', 'r') as console:
-            _, console_width = console.read().split()
-            console_width = int(console_width)
-    except:
-        # If we can't get the console width, use 80 as default
-        console_width = 80
+    # Compute the BLEU metric
+    metric = torchmetrics.text.BLEUScore()
+    bleu = metric(predicted, expected)
+    writer.add_scalar('validation BLEU', bleu, global_step)
 
-    with torch.no_grad():
-        for batch in validation_ds:
-            count += 1
-            encoder_input = batch["encoder_input"].to(device) # (b, seq_len)
-            encoder_mask = batch["encoder_mask"].to(device) # (b, 1, 1, seq_len)
+    writer.flush()
 
-            # check that the batch size is 1
-            assert encoder_input.size(
-                0) == 1, "Batch size must be 1 for validation"
 
-            model_out = greedy_decode(model, encoder_input, encoder_mask, tokenizer_src, tokenizer_tgt, max_len, device)
+def check_envrionments():
+    ## TODO: If bp16, check further
+    if cuda.is_available():
+        print(f"Cuda capactiy: {cuda.get_device_capability(torch.device('cuda'))}")
+        print(f"Cuda Props: {cuda.get_device_properties(torch.device('cuda'))}")
+        print("Choose cuda")
+        return torch.device("cuda")
+    else:
+        # Warning
+        print("Choose CPU")
+        return torch.device("cpu")
 
-            source_text = batch["src_text"][0]
-            target_text = batch["tgt_text"][0]
-            model_out_text = tokenizer_tgt.decode(model_out.detach().cpu().numpy())
-
-            source_texts.append(source_text)
-            expected.append(target_text)
-            predicted.append(model_out_text)
-            
-            # Print the source, target and model output
-            print_msg('-'*console_width)
-            print_msg(f"{f'SOURCE: ':>12}{source_text}")
-            print_msg(f"{f'TARGET: ':>12}{target_text}")
-            print_msg(f"{f'PREDICTED: ':>12}{model_out_text}")
-
-            if count == num_examples:
-                print_msg('-'*console_width)
-                break
     
-    if writer:
-        # Evaluate the character error rate
-        # Compute the char error rate 
-        metric = torchmetrics.CharErrorRate()
-        cer = metric(predicted, expected)
-        writer.add_scalar('validation cer', cer, global_step)
-        writer.flush()
+def setup_parallism(config):
+    # Add local rank and global rank to the config
+    config["local_rank"] = int(os.environ['LOCAL_RANK'])
+    config["global_rank"] = int(os.environ['RANK'])
 
-        # Compute the word error rate
-        metric = torchmetrics.WordErrorRate()
-        wer = metric(predicted, expected)
-        writer.add_scalar('validation wer', wer, global_step)
-        writer.flush()
+    assert config["local_rank"] != -1, "LOCAL_RANK environment variable not set"
+    assert config["global_rank"] != -1, "RANK environment variable not set"
 
-        # Compute the BLEU metric
-        metric = torchmetrics.BLEUScore()
-        bleu = metric(predicted, expected)
-        writer.add_scalar('validation BLEU', bleu, global_step)
-        writer.flush()
+    # Print configuration (only once per server)
+    if config["local_rank"] == 0:
+        print("Configuration:")
+        for key, value in config.items():
+            print(f"{key:>20}: {value}")
+
+    # Setup distributed training
+    init_process_group(backend='nccl')
+    torch.cuda.set_device(config['local_rank'])
+
 
 def get_all_sentences(ds, lang):
     for item in ds:
         yield item['translation'][lang]
 
-def get_or_build_tokenizer(config, ds, lang):
-    tokenizer_path = Path(config['tokenizer_file'].format(lang))
-    if not Path.exists(tokenizer_path):
-        # Most code taken from: https://huggingface.co/docs/tokenizers/quicktour
+
+def get_or_train_tokenizer(dataset, config, lang):
+    tokenizer_path = Path(config["tokenizer_file"].format(lang))
+
+    if tokenizer_path.is_file():
+        tokenizer = Tokenizer.from_file(str(tokenizer_path))
+    else:
         tokenizer = Tokenizer(WordLevel(unk_token="[UNK]"))
         tokenizer.pre_tokenizer = Whitespace()
         trainer = WordLevelTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"], min_frequency=2)
-        tokenizer.train_from_iterator(get_all_sentences(ds, lang), trainer=trainer)
+        tokenizer.train_from_iterator(get_all_sentences(dataset, lang), trainer=trainer)
         tokenizer.save(str(tokenizer_path))
-    else:
-        tokenizer = Tokenizer.from_file(str(tokenizer_path))
+
     return tokenizer
 
-def get_ds(config):
-    # It only has the train split, so we divide it overselves
-    ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train')
 
-    # Build tokenizers
-    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config['lang_src'])
-    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config['lang_tgt'])
+def get_datasets(config):
+    local_rank = int(os.environ['LOCAL_RANK'])
+    if Path("dsraw.hf").exists():
+        print("Load dataset from local file")
+        ds_raw = load_from_disk(f"dsraw.hf")
+    else:
+        print(f"current working dir: {os.getcwd()}")
+        print("Load dataset from huggingface")
+        ds_raw = load_dataset(f"{config['datasource']}", f"{config['lang_src']}-{config['lang_tgt']}", split='train')
+        ds_raw.save_to_disk(f"dsraw.hf")
 
-    # Keep 90% for training, 10% for validation
-    train_ds_size = int(0.9 * len(ds_raw))
-    val_ds_size = len(ds_raw) - train_ds_size
-    train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
+    # cherry pick first 300 to test
+    ds_raw = ds_raw.select(range(300))
 
-    train_ds = BilingualDataset(train_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
-    val_ds = BilingualDataset(val_ds_raw, tokenizer_src, tokenizer_tgt, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    input_tokenizer = get_or_train_tokenizer(ds_raw, config, config["lang_src"])
+    output_tokenizer = get_or_train_tokenizer(ds_raw, config, config["lang_tgt"])
+    print("Got input and output tokenizers")
 
-    # Find the maximum length of each sentence in the source and target sentence
-    max_len_src = 0
-    max_len_tgt = 0
+    # Split to 9:1 ratio
+    training_set, validation_set = random_split(ds_raw, [0.9, 0.1])
 
-    for item in ds_raw:
-        src_ids = tokenizer_src.encode(item['translation'][config['lang_src']]).ids
-        tgt_ids = tokenizer_tgt.encode(item['translation'][config['lang_tgt']]).ids
-        max_len_src = max(max_len_src, len(src_ids))
-        max_len_tgt = max(max_len_tgt, len(tgt_ids))
+    training_ds = TranslationDataLoader(training_set, input_tokenizer, output_tokenizer, config['lang_src'], config['lang_tgt'], config['seq_len'])
+    validation_ds = TranslationDataLoader(validation_set, input_tokenizer, output_tokenizer, config['lang_src'], config['lang_tgt'], config['seq_len'])
 
-    print(f'Max length of source sentence: {max_len_src}')
-    print(f'Max length of target sentence: {max_len_tgt}')
-    
+    if not config["use_parallel"]:
+        dist_sampler = None
+        train_loader = DataLoader(training_ds, batch_size=config['batch_size'], shuffle=True)
+    else:
+        dist_sampler = DistributedSampler(training_ds, shuffle=True)
+        train_loader = DataLoader(training_ds, batch_size=config['batch_size'], shuffle=False, sampler=dist_sampler)
 
-    train_dataloader = DataLoader(train_ds, batch_size=config['batch_size'], shuffle=True)
-    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    validation_loader = DataLoader(validation_ds, batch_size=1, shuffle=True)
 
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    print("Datasets loaded")
 
-def get_model(config, vocab_src_len, vocab_tgt_len):
-    model = build_transformer(vocab_src_len, vocab_tgt_len, config["seq_len"], config['seq_len'], d_model=config['d_model'])
-    return model
+    return train_loader, validation_loader, dist_sampler, input_tokenizer, output_tokenizer
+
+
+def get_model(src_vocab_size, tgt_vocab_size, src_seq_len, tgt_seq_len, device):
+    model = build_transformer(src_vocab_size, tgt_vocab_size, src_seq_len, tgt_seq_len)
+    return model.to(device)
+
 
 def train_model(config):
-    # Define the device
-    device = "cuda" if torch.cuda.is_available() else "mps" if torch.has_mps or torch.backends.mps.is_available() else "cpu"
-    print("Using device:", device)
-    if (device == 'cuda'):
-        print(f"Device name: {torch.cuda.get_device_name(device.index)}")
-        print(f"Device memory: {torch.cuda.get_device_properties(device.index).total_memory / 1024 ** 3} GB")
-    elif (device == 'mps'):
-        print(f"Device name: <mps>")
-    else:
-        print("NOTE: If you have a GPU, consider using it for training.")
-        print("      On a Windows machine with NVidia GPU, check this video: https://www.youtube.com/watch?v=GMSjDTU8Zlc")
-        print("      On a Mac machine, run: pip3 install --pre torch torchvision torchaudio torchtext --index-url https://download.pytorch.org/whl/nightly/cpu")
-    device = torch.device(device)
+    writer = SummaryWriter("original_transformer")
+    # Check environment, decide the training device
+    device = check_envrionments()
 
-    # Make sure the weights folder exists
-    Path(f"{config['datasource']}_{config['model_folder']}").mkdir(parents=True, exist_ok=True)
+    # Load dataset, tokenizers
+    train_ds, val_ds, dist_sampler, in_tokenizer, out_tokenizer = get_datasets(config)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
-    model = get_model(config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()).to(device)
-    # Tensorboard
-    writer = SummaryWriter(config['experiment_name'])
+    # Load model if exists
+    # !!! Why use len() instead of vocab_size? because len considered special tokens, vocab size dont
+    # During embedding, we want special tokens to have their own embeddings
+    model = get_model(
+        in_tokenizer.get_vocab_size(with_added_tokens=True),
+        out_tokenizer.get_vocab_size(with_added_tokens=True),
+        config["seq_len"], config["seq_len"], device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=config['lr'], eps=1e-9)
+    if config["use_parallel"]:
+        model = DistributedDataParallel(model, device_ids=[config['local_rank']])
 
+    # Setup optimizer / loss function
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["lr"])
+    # !!!! to(device)
+    criterion = torch.nn.CrossEntropyLoss(ignore_index=out_tokenizer.token_to_id("[PAD]"), label_smoothing=0.1).to(device)
+
+    prof = torch.profiler.profile(
+        schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+        on_trace_ready=torch.profiler.tensorboard_trace_handler("./log/plain/"),
+        profile_memory=True
+    )
+
+    # Setup training loop
+    ### If any preload
     # If the user specified a model to preload before training, load it
     initial_epoch = 0
     global_step = 0
     preload = config['preload']
     model_filename = latest_weights_file_path(config) if preload == 'latest' else get_weights_file_path(config, preload) if preload else None
+
+    model_filename = model_filename if not config["use_parallel"] else (model_filename + "_ddp")
+
     if model_filename:
         print(f'Preloading model {model_filename}')
         state = torch.load(model_filename)
@@ -217,58 +263,98 @@ def train_model(config):
     else:
         print('No model to preload, starting from scratch')
 
-    loss_fn = nn.CrossEntropyLoss(ignore_index=tokenizer_src.token_to_id('[PAD]'), label_smoothing=0.1).to(device)
-
-    for epoch in range(initial_epoch, config['num_epochs']):
+    for each_epoch in range(initial_epoch, config["num_epochs"]):
+        # !!!!
         torch.cuda.empty_cache()
+        # Set model to train
+        # !!!!
         model.train()
-        batch_iterator = tqdm(train_dataloader, desc=f"Processing Epoch {epoch:02d}")
-        for batch in batch_iterator:
+        # Set parallel sampler if exits
+        if config["use_parallel"] and dist_sampler:
+            dist_sampler.set_epoch(each_epoch)
 
-            encoder_input = batch['encoder_input'].to(device) # (b, seq_len)
-            decoder_input = batch['decoder_input'].to(device) # (B, seq_len)
-            encoder_mask = batch['encoder_mask'].to(device) # (B, 1, 1, seq_len)
-            decoder_mask = batch['decoder_mask'].to(device) # (B, 1, seq_len, seq_len)
-
-            # Run the tensors through the encoder, decoder and the projection layer
-            encoder_output = model.encode(encoder_input, encoder_mask) # (B, seq_len, d_model)
-            decoder_output = model.decode(encoder_output, encoder_mask, decoder_input, decoder_mask) # (B, seq_len, d_model)
-            proj_output = model.project(decoder_output) # (B, seq_len, vocab_size)
-
-            # Compare the output with the label
-            label = batch['label'].to(device) # (B, seq_len)
-
-            # Compute the loss using a simple cross entropy
-            loss = loss_fn(proj_output.view(-1, tokenizer_tgt.get_vocab_size()), label.view(-1))
-            batch_iterator.set_postfix({"loss": f"{loss.item():6.3f}"})
-
-            # Log the loss
+        prof.start()
+        batch_iter = tqdm(train_ds, desc=f"processing {each_epoch}", disable=(int(os.environ["LOCAL_RANK"]) != 0))
+        for one_batch in batch_iter:
+            # extract 4 inputs, to(device)
+            encoder_input = one_batch["encoder_input"].to(device)
+            decoder_input = one_batch["decoder_input"].to(device)
+            encoder_mask = one_batch["encoder_mask"].to(device)
+            decoder_mask = one_batch["decoder_mask"].to(device)
+            # B * seq_len
+            label = one_batch["label"].to(device)
+            # output = model()
+            # B * seq_len * len_vocab
+            model_output = model(encoder_input, encoder_mask, decoder_input, decoder_mask)
+            # loss = criterion()
+            loss = criterion(model_output.view(-1, out_tokenizer.get_vocab_size(with_added_tokens=True)), label.view(-1))
+            batch_iter.set_postfix({"loss": f"{loss.item():6.3f}"})
             writer.add_scalar('train loss', loss.item(), global_step)
             writer.flush()
 
-            # Backpropagate the loss
             loss.backward()
-
-            # Update the weights
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-
             global_step += 1
 
-        # Run validation at the end of every epoch
-        run_validation(model, val_dataloader, tokenizer_src, tokenizer_tgt, config['seq_len'], device, lambda msg: batch_iterator.write(msg), global_step, writer)
+        prof.stop()
+        # After each epoch
+        # Run validation once and print out text
+        validate_training_results(
+            model, val_ds, out_tokenizer, device, config["seq_len"], global_step, writer, config["use_parallel"])
 
+        # save models
         # Save the model at the end of every epoch
-        model_filename = get_weights_file_path(config, f"{epoch:02d}")
+        model_filename = get_weights_file_path(config, f"{each_epoch:02d}")
         torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'epoch': each_epoch,
+            'model_state_dict': model.module.state_dict() if config["use_parallel"] else model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'global_step': global_step
-        }, model_filename)
+        }, model_filename if not config["use_parallel"] else model_filename + "_ddp")
 
 
-if __name__ == '__main__':
-    warnings.filterwarnings("ignore")
-    config = get_config()
-    train_model(config)
+def arg_parser():
+    parser = argparse.ArgumentParser()
+    # To update
+    for key, value in get_config().items():
+        parser.add_argument(
+            f"--{key.replace('_', '-')}", default=value, type=type(value), \
+            help=f"Choose {key} for config"
+        )
+
+    parser.add_argument("--use-parallel", action="store_true")
+    return parser
+
+
+if __name__ == "__main__":
+    args = arg_parser().parse_args()
+
+    updated_config = get_config()
+    updated_config.update({
+        "batch_size": args.batch_size,
+        "num_epochs": args.num_epochs,
+        "lr": args.lr,
+        "seq_len": args.seq_len,
+        "d_model": args.d_model,
+        "datasource": args.datasource,
+        "lang_src": args.lang_src, 
+        "lang_tgt": args.lang_tgt,
+        "model_folder": args.model_folder,
+        "model_basename": args.model_basename,
+        "preload": args.preload,
+        "tokenizer_file": args.tokenizer_file,
+        "experiment_name": args.experiment_name,
+        "use_parallel": args.use_parallel
+    })
+
+    if not Path(args.model_folder).exists():
+        Path(args.model_folder).mkdir(exist_ok=True)
+
+    if updated_config["use_parallel"]:
+        setup_parallism(updated_config)
+
+    train_model(updated_config)
+
+    if updated_config["use_parallel"]:
+        destroy_process_group()

@@ -3,7 +3,7 @@ from config import get_config, latest_weights_file_path
 from model import build_transformer
 from tokenizers import Tokenizer
 from datasets import load_dataset
-from dataset import BilingualDataset
+from hide_dataset import BilingualDataset
 import torch
 import sys
 
